@@ -1,0 +1,218 @@
+name: iOS Self Build
+
+# OpenBitFun iOS 自建真机包（无 Mac 路线）
+#
+# 用法：把本文件放到你 fork 的 .github/workflows/ios-selfbuild.yml
+#   1) fork 必须是 public（公开仓库的 GitHub Actions 机器时间免费，含 macOS runner）
+#   2) Settings -> Secrets and variables -> Actions 里配好下面 4~5 个 secret
+#   3) Actions -> iOS Self Build -> Run workflow
+#
+# secrets:
+#   P12_BASE64              p12 文件内容的 base64（单行）
+#   P12_PASSWORD            p12 密码
+#   MOBILEPROVISION_BASE64  描述文件 .mobileprovision 内容的 base64（单行）
+#   TEAM_ID                 苹果 Team ID（10 位，developer.apple.com -> Membership 可见）
+#   KEYCHAIN_PASSWORD       随便一串临时密码，只用于 runner 上的临时钥匙串
+#
+# 三个签名 secret 只要缺一个，就自动降级成"未签名包"（供 Windows 端 zsign / 爱思助手重签）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: "构建配置：Debug（默认，匹配仓库里的 debug XCFramework）"
+        required: true
+        default: Debug
+        type: choice
+        options:
+          - Debug
+          - Release
+      bundle_id:
+        description: "Bundle ID 覆盖（留空=工程默认 com.openbitfun.mobile.ios）"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  ios:
+    name: Build iOS IPA
+    runs-on: macos-15
+    timeout-minutes: 150
+
+    env:
+      P12_BASE64: ${{ secrets.P12_BASE64 }}
+      P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+      MOBILEPROVISION_BASE64: ${{ secrets.MOBILEPROVISION_BASE64 }}
+      TEAM_ID: ${{ secrets.TEAM_ID }}
+      KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+      BUNDLE_ID: ${{ inputs.bundle_id || 'com.openbitfun.mobile.ios' }}
+      CONFIGURATION: ${{ inputs.configuration }}
+      PROJECT: src/apps/mobile/ios/OpenBitFun.xcodeproj
+      KC: ${{ runner.temp }}/signing.keychain-db
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Select Xcode and report toolchain
+        # runner 镜像里通常装了多个 Xcode；工程由 Xcode 16.4 创建，选版本号最高的那个
+        run: |
+          set -euo pipefail
+          echo "可用 Xcode："
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+          PICK="$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort | tail -1 || true)"
+          if [[ -n "$PICK" ]]; then
+            sudo xcode-select -s "$PICK/Contents/Developer"
+            echo "选用：$PICK"
+          else
+            echo "选用镜像默认 Xcode"
+          fi
+          xcodebuild -version
+          xcode-select -p
+          node -v
+          echo "node path: $(command -v node)"
+
+      - name: Make node visible to the Xcode build phase
+        # MiniApp 资源构建阶段把 PATH 固定成 /opt/homebrew/bin:/usr/local/bin:$PATH
+        run: |
+          set -euo pipefail
+          sudo ln -sfn "$(command -v node)" /usr/local/bin/node
+          /usr/local/bin/node -v
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build Kotlin shared XCFramework
+        # 仓库里没有预编译产物，Xcode 链接的就是这个 XCFramework，必须先在 macOS 上编出来
+        working-directory: src/apps/mobile/shared
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew --no-daemon :core-feature:assembleOpenBitFunMobileCoreDebugXCFramework
+          test -d core-feature/build/XCFrameworks/debug/OpenBitFunMobileCore.xcframework
+
+      - name: Detect signing mode
+        id: mode
+        run: |
+          if [[ -n "${P12_BASE64:-}" && -n "${MOBILEPROVISION_BASE64:-}" && -n "${TEAM_ID:-}" ]]; then
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+            echo "本次产出：已用你的 p12 + 描述文件签名"
+          else
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::P12_BASE64 / MOBILEPROVISION_BASE64 / TEAM_ID 不齐，本次只产出未签名包"
+          fi
+
+      - name: Import certificate and provisioning profile
+        if: steps.mode.outputs.signed == 'true'
+        run: |
+          set -euo pipefail
+          echo -n "$P12_BASE64" | tr -d '\n\r' | openssl base64 -d -A -out "$RUNNER_TEMP/cert.p12"
+          echo -n "$MOBILEPROVISION_BASE64" | tr -d '\n\r' | openssl base64 -d -A -out "$RUNNER_TEMP/profile.mobileprovision"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KC"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$P12_PASSWORD" \
+            -A -T /usr/bin/codesign -T /usr/bin/security
+
+          # 补上 Apple WWDR 中间证书，否则设备侧链条校验容易失败
+          curl -fsSL -o "$RUNNER_TEMP/wwdr.cer" https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer
+          security import "$RUNNER_TEMP/wwdr.cer" -k "$KC" -A -T /usr/bin/codesign || true
+
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KC" >/dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          cp "$RUNNER_TEMP/profile.mobileprovision" ~/Library/MobileDevice/Provisioning\ Profiles/
+
+          echo "--- 钥匙串里的签名身份 ---"
+          security find-identity -v -p codesigning "$KC"
+
+          security cms -D -i "$RUNNER_TEMP/profile.mobileprovision" > "$RUNNER_TEMP/profile.plist"
+          {
+            echo "PROFILE_NAME=$(/usr/libexec/PlistBuddy -c 'Print :Name' "$RUNNER_TEMP/profile.plist")"
+            echo "PROFILE_UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$RUNNER_TEMP/profile.plist")"
+          } >> "$GITHUB_ENV"
+
+          echo "--- 描述文件体检 ---"
+          echo "Name:        $PROFILE_NAME"
+          /usr/libexec/PlistBuddy -c 'Print :ExpirationDate' "$RUNNER_TEMP/profile.plist" || true
+          /usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$RUNNER_TEMP/profile.plist" || true
+          echo -n "ProvisionedDevices: "
+          /usr/libexec/PlistBuddy -c 'Print :ProvisionedDevices' "$RUNNER_TEMP/profile.plist" 2>/dev/null | grep -c . || echo "0（企业 In-House / 或未绑定 UDID）"
+
+      - name: Archive (signed)
+        if: steps.mode.outputs.signed == 'true'
+        run: |
+          set -euo pipefail
+          IDENTITY="$(security find-identity -v -p codesigning "$KC" | awk '/"/{print $2; exit}')"
+          echo "使用签名身份: $IDENTITY"
+          echo "使用描述文件: $PROFILE_NAME"
+          xcodebuild archive \
+            -project "$PROJECT" \
+            -scheme OpenBitFun \
+            -configuration "$CONFIGURATION" \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/OpenBitFun.xcarchive" \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            CODE_SIGN_IDENTITY="$IDENTITY" \
+            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
+            PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+            ONLY_ACTIVE_ARCH=NO
+
+      - name: Archive (unsigned)
+        if: steps.mode.outputs.signed != 'true'
+        run: |
+          set -euo pipefail
+          xcodebuild archive \
+            -project "$PROJECT" \
+            -scheme OpenBitFun \
+            -configuration "$CONFIGURATION" \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/OpenBitFun.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+            ONLY_ACTIVE_ARCH=NO
+
+      - name: Package IPA
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/OpenBitFun.xcarchive/Products/Applications/OpenBitFun.app"
+          test -d "$APP" || { echo "找不到产物: $APP"; find "$RUNNER_TEMP/OpenBitFun.xcarchive" -maxdepth 4 -name '*.app'; exit 1; }
+
+          if [[ "${{ steps.mode.outputs.signed }}" == "true" ]]; then SUFFIX=signed; else SUFFIX=unsigned; fi
+          rm -rf "$RUNNER_TEMP/Payload"
+          mkdir -p "$RUNNER_TEMP/Payload"
+          cp -R "$APP" "$RUNNER_TEMP/Payload/"
+          (cd "$RUNNER_TEMP" && zip -qry "OpenBitFun-$SUFFIX.ipa" Payload)
+
+          IPA="$RUNNER_TEMP/OpenBitFun-$SUFFIX.ipa"
+          shasum -a 256 "$IPA" | tee "$RUNNER_TEMP/SHA256SUMS"
+
+          echo "--- 签名信息 ---"
+          /usr/bin/codesign -dv --verbose=4 "$APP" 2>&1 | head -25 || true
+          if [[ -f "$APP/embedded.mobileprovision" ]]; then
+            echo "embedded.mobileprovision: 已嵌入"
+          else
+            echo "embedded.mobileprovision: 无（未签名包，需在 Windows 上用 zsign/爱思助手重签）"
+          fi
+          ls -lh "$IPA"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v6
+        with:
+          name: OpenBitFun-ios-${{ github.run_number }}
+          path: |
+            ${{ runner.temp }}/OpenBitFun-*.ipa
+            ${{ runner.temp }}/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14

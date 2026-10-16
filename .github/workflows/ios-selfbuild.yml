@@ -1,20 +1,16 @@
 name: iOS Self Build
 
-# OpenBitFun iOS 自建真机包（无 Mac 路线）
+# OpenBitFun iOS 自建真机包（无 Mac 路线，只出未签名 IPA，签名交给本机爱思助手）
 #
-# 用法：把本文件放到你 fork 的 .github/workflows/ios-selfbuild.yml
-#   1) fork 必须是 public（公开仓库的 GitHub Actions 机器时间免费，含 macOS runner）
-#   2) Settings -> Secrets and variables -> Actions 里配好下面 4~5 个 secret
-#   3) Actions -> iOS Self Build -> Run workflow
+# 用法：把本文件放到你 fork 的 .github/workflows/ios-selfbuild.yml，手动 Run workflow。
+#   3 个签名 secret 只要缺一个，就自动走"未签名包"分支 —— 爱思助手签名路线不需要配任何 secret。
 #
-# secrets:
+# 可选 secrets（要走云端直接签名才需要）：
 #   P12_BASE64              p12 文件内容的 base64（单行）
 #   P12_PASSWORD            p12 密码
 #   MOBILEPROVISION_BASE64  描述文件 .mobileprovision 内容的 base64（单行）
-#   TEAM_ID                 苹果 Team ID（10 位，developer.apple.com -> Membership 可见）
+#   TEAM_ID                 苹果 Team ID（10 位）
 #   KEYCHAIN_PASSWORD       随便一串临时密码，只用于 runner 上的临时钥匙串
-#
-# 三个签名 secret 只要缺一个，就自动降级成"未签名包"（供 Windows 端 zsign / 爱思助手重签）。
 
 on:
   workflow_dispatch:
@@ -40,17 +36,6 @@ jobs:
     name: Build iOS IPA
     runs-on: macos-15
     timeout-minutes: 150
-
-    env:
-      P12_BASE64: ${{ secrets.P12_BASE64 }}
-      P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
-      MOBILEPROVISION_BASE64: ${{ secrets.MOBILEPROVISION_BASE64 }}
-      TEAM_ID: ${{ secrets.TEAM_ID }}
-      KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
-      BUNDLE_ID: ${{ inputs.bundle_id || 'com.openbitfun.mobile.ios' }}
-      CONFIGURATION: ${{ inputs.configuration }}
-      PROJECT: src/apps/mobile/ios/OpenBitFun.xcodeproj
-      KC: ${{ runner.temp }}/signing.keychain-db
 
     steps:
       - name: Checkout
@@ -99,6 +84,10 @@ jobs:
 
       - name: Detect signing mode
         id: mode
+        env:
+          P12_BASE64: ${{ secrets.P12_BASE64 }}
+          MOBILEPROVISION_BASE64: ${{ secrets.MOBILEPROVISION_BASE64 }}
+          TEAM_ID: ${{ secrets.TEAM_ID }}
         run: |
           if [[ -n "${P12_BASE64:-}" && -n "${MOBILEPROVISION_BASE64:-}" && -n "${TEAM_ID:-}" ]]; then
             echo "signed=true" >> "$GITHUB_OUTPUT"
@@ -110,8 +99,14 @@ jobs:
 
       - name: Import certificate and provisioning profile
         if: steps.mode.outputs.signed == 'true'
+        env:
+          P12_BASE64: ${{ secrets.P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          MOBILEPROVISION_BASE64: ${{ secrets.MOBILEPROVISION_BASE64 }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
         run: |
           set -euo pipefail
+          KC="$RUNNER_TEMP/signing.keychain-db"
           echo -n "$P12_BASE64" | tr -d '\n\r' | openssl base64 -d -A -out "$RUNNER_TEMP/cert.p12"
           echo -n "$MOBILEPROVISION_BASE64" | tr -d '\n\r' | openssl base64 -d -A -out "$RUNNER_TEMP/profile.mobileprovision"
 
@@ -149,38 +144,50 @@ jobs:
 
       - name: Archive (signed)
         if: steps.mode.outputs.signed == 'true'
+        env:
+          TEAM_ID: ${{ secrets.TEAM_ID }}
         run: |
           set -euo pipefail
+          KC="$RUNNER_TEMP/signing.keychain-db"
+          PROJECT=src/apps/mobile/ios/OpenBitFun.xcodeproj
+          CFG="${{ inputs.configuration }}"
+          BID="${{ inputs.bundle_id }}"
+          [[ -n "$BID" ]] || BID=com.openbitfun.mobile.ios
+
           IDENTITY="$(security find-identity -v -p codesigning "$KC" | awk '/"/{print $2; exit}')"
           echo "使用签名身份: $IDENTITY"
           echo "使用描述文件: $PROFILE_NAME"
           xcodebuild archive \
             -project "$PROJECT" \
             -scheme OpenBitFun \
-            -configuration "$CONFIGURATION" \
+            -configuration "$CFG" \
             -destination 'generic/platform=iOS' \
             -archivePath "$RUNNER_TEMP/OpenBitFun.xcarchive" \
             CODE_SIGN_STYLE=Manual \
             DEVELOPMENT_TEAM="$TEAM_ID" \
             CODE_SIGN_IDENTITY="$IDENTITY" \
             PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
-            PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+            PRODUCT_BUNDLE_IDENTIFIER="$BID" \
             ONLY_ACTIVE_ARCH=NO
 
       - name: Archive (unsigned)
         if: steps.mode.outputs.signed != 'true'
         run: |
           set -euo pipefail
+          PROJECT=src/apps/mobile/ios/OpenBitFun.xcodeproj
+          CFG="${{ inputs.configuration }}"
+          BID="${{ inputs.bundle_id }}"
+          [[ -n "$BID" ]] || BID=com.openbitfun.mobile.ios
           xcodebuild archive \
             -project "$PROJECT" \
             -scheme OpenBitFun \
-            -configuration "$CONFIGURATION" \
+            -configuration "$CFG" \
             -destination 'generic/platform=iOS' \
             -archivePath "$RUNNER_TEMP/OpenBitFun.xcarchive" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
-            PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+            PRODUCT_BUNDLE_IDENTIFIER="$BID" \
             ONLY_ACTIVE_ARCH=NO
 
       - name: Package IPA
